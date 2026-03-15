@@ -3,34 +3,46 @@ import shutil
 import asyncio
 import tempfile
 import subprocess
+import time
+import mimetypes
+from collections import defaultdict
 from urllib.parse import urlparse
-from fastapi import FastAPI, UploadFile, File, HTTPException, Header
+from fastapi import FastAPI, UploadFile, File, HTTPException, Header, Request
 from fastapi.responses import Response
 from pydantic import BaseModel
 
 app = FastAPI(title="Archie Audio Service")
 
-# ── Config dari environment ───────────────────────────────────
-SERVICE_SECRET   = os.environ.get("SERVICE_SECRET", "")       # wajib set di .env
+SERVICE_SECRET   = os.environ.get("SERVICE_SECRET", "")
 FFMPEG_THREADS   = int(os.environ.get("FFMPEG_THREADS", "2"))
-COOKIES_FILE     = os.environ.get("COOKIES_FILE", "")         # path ke cookies.txt (opsional tapi direkomendasikan)
-MAX_CONCURRENT   = int(os.environ.get("MAX_CONCURRENT", "2")) # max download bersamaan
+COOKIES_FILE     = os.environ.get("COOKIES_FILE", "")
+MAX_CONCURRENT   = int(os.environ.get("MAX_CONCURRENT", "2"))
 
-# ── Semaphore: batasi concurrent download ─────────────────────
+RATE_LIMIT_WINDOW   = int(os.environ.get("RATE_LIMIT_WINDOW", "60"))
+RATE_LIMIT_MAX      = int(os.environ.get("RATE_LIMIT_MAX", "10"))
+
 _semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
-# ── Domain yang diizinkan ─────────────────────────────────────
+_rate_store: dict[str, list[float]] = defaultdict(list)
+_rate_lock = asyncio.Lock()
+
 ALLOWED_DOMAINS = {
     "youtube.com", "www.youtube.com", "youtu.be",
     "music.youtube.com",
     "soundcloud.com", "www.soundcloud.com",
 }
 
-# ── Audio processing config ───────────────────────────────────
-# speed 2.0x via sample rate manipulation:
-#   asetrate=88200 (44100 × 2) → pitch & speed naik 2x
-#   aresample=44100             → kembalikan sample rate, pitch tetap 2x
-# Di Roblox: PlaybackSpeed = 0.5 → speed & pitch balik normal
+ALLOWED_MIME_TYPES = {
+    "audio/mpeg", "audio/mp3", "audio/ogg", "audio/wav",
+    "audio/x-wav", "audio/wave", "audio/x-m4a", "audio/mp4",
+    "audio/aac", "audio/flac", "audio/x-flac",
+    "video/mp4", "video/webm",
+}
+
+ALLOWED_EXTENSIONS = {
+    ".mp3", ".ogg", ".wav", ".m4a", ".aac", ".flac", ".mp4", ".webm"
+}
+
 AUDIO_FILTERS = ",".join([
     "highpass=f=30",
     "silenceremove=start_periods=1:start_silence=0.1:start_threshold=-60dB",
@@ -40,24 +52,48 @@ AUDIO_FILTERS = ",".join([
 ])
 FFMPEG_ARGS = ["-codec:a", "libmp3lame", "-q:a", "2", "-ar", "44100"]
 
-ROBLOX_MAX_DURATION = 415   # 415 detik → setelah 2x speed = ~207 detik < 7 menit Roblox
-MAX_FILE_SIZE       = 150 * 1024 * 1024  # 150MB
+ROBLOX_MAX_DURATION = 415
+MAX_FILE_SIZE       = 150 * 1024 * 1024
+CHUNK_SIZE          = 1024 * 1024
 
 
-# ── Auth middleware ───────────────────────────────────────────
 def check_auth(x_service_key: str = ""):
-    if SERVICE_SECRET and x_service_key != SERVICE_SECRET:
+    if not SERVICE_SECRET:
+        raise HTTPException(status_code=500, detail="Service not configured — SERVICE_SECRET belum di-set")
+    if x_service_key != SERVICE_SECRET:
         raise HTTPException(status_code=403, detail="Forbidden — invalid service key")
 
 
-# ── Helpers ───────────────────────────────────────────────────
+async def check_rate_limit(request: Request):
+    client_ip = request.client.host if request.client else "unknown"
+    now = time.time()
+    async with _rate_lock:
+        timestamps = _rate_store[client_ip]
+        cutoff = now - RATE_LIMIT_WINDOW
+        _rate_store[client_ip] = [t for t in timestamps if t > cutoff]
+        if len(_rate_store[client_ip]) >= RATE_LIMIT_MAX:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Rate limit exceeded — max {RATE_LIMIT_MAX} requests per {RATE_LIMIT_WINDOW}s"
+            )
+        _rate_store[client_ip].append(now)
+
+
+def validate_file_type(filename: str, content_type: str):
+    ext = os.path.splitext(filename or "")[1].lower()
+    if ext and ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(status_code=400, detail=f"Ekstensi tidak diizinkan: {ext}")
+    mime = (content_type or "").split(";")[0].strip().lower()
+    if mime and mime not in ALLOWED_MIME_TYPES and mime != "application/octet-stream":
+        raise HTTPException(status_code=400, detail=f"Tipe file tidak diizinkan: {mime}")
+
+
 def validate_url(url: str):
     try:
         parsed = urlparse(url)
         domain = parsed.netloc.lower()
     except Exception:
         raise HTTPException(status_code=400, detail="URL tidak valid")
-    # strip www.
     domain_stripped = domain.replace("www.", "")
     if domain not in ALLOWED_DOMAINS and domain_stripped not in ALLOWED_DOMAINS:
         raise HTTPException(status_code=400, detail=f"Domain tidak diizinkan: {domain}")
@@ -122,7 +158,6 @@ def build_ydl_opts(output_template: str) -> dict:
         "quiet": False,
         "no_warnings": False,
         "socket_timeout": 30,
-        # Update yt-dlp lebih stabil dengan player client iOS di VPS
         "extractor_args": {
             "youtube": {
                 "player_client": ["ios", "web_creator", "android"],
@@ -136,13 +171,10 @@ def build_ydl_opts(output_template: str) -> dict:
             )
         },
     }
-    # Gunakan cookies.txt kalau ada → jauh lebih stabil di VPS
     if COOKIES_FILE and os.path.exists(COOKIES_FILE):
         opts["cookiefile"] = COOKIES_FILE
     return opts
 
-
-# ── Endpoints ─────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
@@ -154,25 +186,36 @@ def health():
         "cookies_loaded": bool(COOKIES_FILE and os.path.exists(COOKIES_FILE)),
         "max_input_duration_minutes": round(ROBLOX_MAX_DURATION * 2.0 / 60, 1),
         "speed_factor": 2.0,
+        "rate_limit": f"{RATE_LIMIT_MAX} req/{RATE_LIMIT_WINDOW}s per IP",
     }
 
 
 @app.post("/process")
 async def process_audio(
+    request: Request,
     file: UploadFile = File(...),
     x_service_key: str = Header(default="")
 ):
     check_auth(x_service_key)
+    await check_rate_limit(request)
 
-    suffix = os.path.splitext(file.filename or "audio")[1] or ".mp3"
+    validate_file_type(file.filename or "", file.content_type or "")
+
+    suffix = os.path.splitext(file.filename or "audio")[1].lower() or ".mp3"
+
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(await file.read())
         input_path = tmp.name
-
-    # Cek ukuran file
-    if os.path.getsize(input_path) > MAX_FILE_SIZE:
-        os.unlink(input_path)
-        raise HTTPException(status_code=400, detail="File terlalu besar (max 150MB)")
+        total_size = 0
+        while True:
+            chunk = await file.read(CHUNK_SIZE)
+            if not chunk:
+                break
+            total_size += len(chunk)
+            if total_size > MAX_FILE_SIZE:
+                tmp.close()
+                os.unlink(input_path)
+                raise HTTPException(status_code=400, detail="File terlalu besar (max 150MB)")
+            tmp.write(chunk)
 
     output_path = input_path + "_out.mp3"
     try:
@@ -188,8 +231,10 @@ async def process_audio(
     finally:
         for p in [input_path, output_path]:
             if os.path.exists(p):
-                try: os.unlink(p)
-                except: pass
+                try:
+                    os.unlink(p)
+                except Exception:
+                    pass
 
 
 class DownloadRequest(BaseModel):
@@ -198,13 +243,14 @@ class DownloadRequest(BaseModel):
 
 @app.post("/download")
 async def download_and_process(
+    request: Request,
     req: DownloadRequest,
     x_service_key: str = Header(default="")
 ):
     check_auth(x_service_key)
+    await check_rate_limit(request)
     validate_url(req.url)
 
-    # Batasi concurrent download
     async with _semaphore:
         import yt_dlp
 
